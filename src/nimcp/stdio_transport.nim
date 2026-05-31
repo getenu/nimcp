@@ -4,6 +4,7 @@
 ## It handles JSON-RPC communication over stdin/stdout with concurrent request processing.
 
 import json, locks, options
+import std/[monotimes, times, os]
 import taskpools, cpuinfo
 import types, protocol, server, composed_server, logging
 
@@ -51,43 +52,77 @@ proc processRequestTask(transport: StdioTransport, server: McpServer, line: stri
   ## Had to extract this proc to avoid segfaults with taskpools and generics
   transport.taskpool.spawn processRequestTask[McpServer](addr transport, addr server, line)
 
+proc handleLine[T: ComposedServer | McpServer](server: T, line: string) =
+  ## Parse and handle one JSON-RPC line, echoing the response on stdout.
+  var requestId: JsonRpcId = JsonRpcId(kind: jridString, str: "")
+  try:
+    let request = parseJsonRpcMessage(line)
+    if request.id.isSome():
+      requestId = request.id.get
+    if not request.id.isSome():
+      discard  # notification, no response
+    else:
+      let mcpTransport =
+        McpTransport(kind: tkStdio, capabilities: {tcUnicast})
+      echo $server.handleRequest(mcpTransport, request)
+  except Exception as e:
+    echo $(%createJsonRpcError(requestId, ParseError, "Parse error: " & e.msg))
+
+# stdin is read on a dedicated thread so the main loop can do periodic work
+# (the `idle` callback) between requests. Lines arrive on this channel; an
+# empty string is the EOF sentinel.
+var stdinChannel: Channel[string]
+
+proc stdinReader() {.thread.} =
+  while true:
+    try:
+      stdinChannel.send(stdin.readLine())
+    except IOError, EOFError:
+      stdinChannel.send("")  # signal EOF
+      break
+
 # Main stdio transport serving procedure
-proc serve*[T: ComposedServer | McpServer](transport: StdioTransport, server: T) =
-  ## Serve the MCP server with stdio transport
-  
-  # Configure logging to use stderr to avoid interference with MCP protocol on stdout
+proc serve*[T: ComposedServer | McpServer](
+    transport: StdioTransport, server: T,
+    idle: proc() = nil, idleMs = 200,
+) =
+  ## Serve the MCP server with stdio transport. If `idle` is supplied it is
+  ## called every ~`idleMs` between requests, letting the server do periodic
+  ## background work (heartbeats, polling) on the main thread.
   server.logger.redirectToStderr()
   server.logger.info("Stdio transport started")
 
-  while true:
-    try:
-      let line = stdin.readLine()
-      if line.len == 0:
-        continue
-      
-      # Parse and handle the request directly (no taskpools to avoid segfault)
-      var requestId: JsonRpcId = JsonRpcId(kind: jridString, str: "")
+  if idle == nil:
+    # Plain blocking loop — unchanged behavior for request-only servers.
+    while true:
       try:
-        let request = parseJsonRpcMessage(line)
-        if request.id.isSome():
-          requestId = request.id.get
-        if not request.id.isSome():
-          # Handle notification (no response needed)
-          discard
-        else:
-          # Create transport instance for context access
-          let capabilities = {tcUnicast}  # Stdio supports unicast only
-          let mcpTransport = McpTransport(kind: tkStdio, capabilities: capabilities)
-          let response = server.handleRequest(mcpTransport, request)
-          echo $response
-      except Exception as e:
-        let errorResponse = createJsonRpcError(requestId, ParseError, "Parse error: " & e.msg)
-        echo $(%errorResponse)
-        
-    except EOFError:
-      break
-    except Exception:
-      break
+        let line = stdin.readLine()
+        if line.len > 0:
+          server.handleLine(line)
+      except EOFError:
+        break
+      except Exception:
+        break
+    return
+
+  stdinChannel.open()
+  var reader: Thread[void]
+  createThread(reader, stdinReader)
+  var lastIdle = getMonoTime()
+  var sawEof = false
+  while not sawEof:
+    let (gotLine, line) = stdinChannel.tryRecv()
+    if gotLine:
+      if line.len == 0:
+        sawEof = true  # reader hit EOF
+      else:
+        server.handleLine(line)
+    else:
+      let now = getMonoTime()
+      if (now - lastIdle).inMilliseconds >= idleMs:
+        idle()
+        lastIdle = now
+      sleep 10
 
 proc sendNotificationToSession*(transport: StdioTransport, sessionId: string, notificationType: string, data: JsonNode) {.gcsafe.} =
   ## Send MCP notification to session (for Stdio transport, there's only one session)
