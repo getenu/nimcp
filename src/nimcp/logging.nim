@@ -232,10 +232,12 @@ when declared(chronicles):
     logger.addHandler(chroniclesHandler)
 
 else:
-  # Fallback when Chronicles is not available
+  # Fallback when Chronicles is not available. Default to stderr: on the
+  # stdio transport stdout carries the JSON-RPC protocol, so a stray log
+  # line there corrupts the stream. Servers that want stdout can add
+  # consoleHandler explicitly.
   proc setupChroniclesLogging*(logger: Logger) =
-    ## Fallback when Chronicles is not available - use console logging
-    logger.addHandler(consoleHandler)
+    logger.addHandler(stderrHandler)
 
 # File log handler
 proc fileHandler*(filename: string): LogHandler =
