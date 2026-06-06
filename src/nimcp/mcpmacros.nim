@@ -83,8 +83,11 @@ proc generateInputSchema(params: NimNode, paramDescs: Table[string, string]): Js
           if paramName in paramDescs:
             prop["description"] = newJString(paramDescs[paramName])
           properties[paramName] = prop
-          required.add(newJString(paramName))
-  
+          # A param with a default value is optional — the dispatcher fills it in
+          # when the caller omits it. Only default-less params are required.
+          if param[^1].kind == nnkEmpty:
+            required.add(newJString(paramName))
+
   result = newJObject()
   result["type"] = newJString("object")
   result["properties"] = properties
@@ -94,7 +97,7 @@ proc generateInputSchema(params: NimNode, paramDescs: Table[string, string]): Js
 proc generateInputSchemaSkipFirst(params: NimNode, paramDescs: Table[string, string]): JsonNode =
   var properties = newJObject()
   var required = newJArray()
-  
+
   # Skip first param (implicit result) and second param (context), start from index 2
   for i in 2..<params.len:
     let param = params[i]
@@ -107,7 +110,10 @@ proc generateInputSchemaSkipFirst(params: NimNode, paramDescs: Table[string, str
           if paramName in paramDescs:
             prop["description"] = newJString(paramDescs[paramName])
           properties[paramName] = prop
-          required.add(newJString(paramName))
+          # A param with a default value is optional — the dispatcher fills it in
+          # when the caller omits it. Only default-less params are required.
+          if param[^1].kind == nnkEmpty:
+            required.add(newJString(paramName))
   
   result = newJObject()
   result["type"] = newJString("object")
@@ -187,24 +193,35 @@ macro mcpTool*(procDef: untyped): untyped =
       let param = params[i]
       if param.kind == nnkIdentDefs:
         let paramType = param[^2]
+        let defaultVal = param[^1]  # nnkEmpty when the param has no default
         for j in 0..<param.len-2:
           let paramName = $param[j]
           if paramName != "":
             let paramNameLit = newLit(paramName)
             let jsonArgsIdent = ident("jsonArgs")
-            case $paramType:
-            of "int", "int8", "int16", "int32", "int64":
-              argExtractions.add(newCall(bindSym("getInt"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit)))
-            of "uint", "uint8", "uint16", "uint32", "uint64":
-              argExtractions.add(newCall(bindSym("getInt"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit)))
-            of "float", "float32", "float64":
-              argExtractions.add(newCall(bindSym("getFloat"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit)))
-            of "string":
-              argExtractions.add(newCall(bindSym("getStr"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit)))
-            of "bool":
-              argExtractions.add(newCall(bindSym("getBool"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit)))
-            else:
-              argExtractions.add(newCall(bindSym("getStr"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit)))
+            var extraction = case $paramType:
+              of "int", "int8", "int16", "int32", "int64":
+                newCall(bindSym("getInt"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit))
+              of "uint", "uint8", "uint16", "uint32", "uint64":
+                newCall(bindSym("getInt"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit))
+              of "float", "float32", "float64":
+                newCall(bindSym("getFloat"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit))
+              of "string":
+                newCall(bindSym("getStr"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit))
+              of "bool":
+                newCall(bindSym("getBool"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit))
+              else:
+                newCall(bindSym("getStr"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit))
+            if defaultVal.kind != nnkEmpty:
+              # Optional param: honor the proc's default when the key is absent
+              # (matches the schema, which only lists default-less params as
+              # required).
+              extraction = nnkIfExpr.newTree(
+                nnkElifExpr.newTree(
+                  newCall(bindSym("hasKey"), jsonArgsIdent, paramNameLit),
+                  extraction),
+                nnkElseExpr.newTree(defaultVal.copyNimTree))
+            argExtractions.add(extraction)
 
     # Build the function call and wrapper body
     let functionCall = newCall(procName, argExtractions)
@@ -251,24 +268,35 @@ macro mcpTool*(procDef: untyped): untyped =
       let param = params[i]
       if param.kind == nnkIdentDefs:
         let paramType = param[^2]
+        let defaultVal = param[^1]  # nnkEmpty when the param has no default
         for j in 0..<param.len-2:
           let paramName = $param[j]
           if paramName != "":
             let paramNameLit = newLit(paramName)
             let jsonArgsIdent = ident("jsonArgs")
-            case $paramType:
-            of "int", "int8", "int16", "int32", "int64":
-              argExtractions.add(newCall(bindSym("getInt"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit)))
-            of "uint", "uint8", "uint16", "uint32", "uint64":
-              argExtractions.add(newCall(bindSym("getInt"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit)))
-            of "float", "float32", "float64":
-              argExtractions.add(newCall(bindSym("getFloat"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit)))
-            of "string":
-              argExtractions.add(newCall(bindSym("getStr"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit)))
-            of "bool":
-              argExtractions.add(newCall(bindSym("getBool"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit)))
-            else:
-              argExtractions.add(newCall(bindSym("getStr"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit)))
+            var extraction = case $paramType:
+              of "int", "int8", "int16", "int32", "int64":
+                newCall(bindSym("getInt"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit))
+              of "uint", "uint8", "uint16", "uint32", "uint64":
+                newCall(bindSym("getInt"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit))
+              of "float", "float32", "float64":
+                newCall(bindSym("getFloat"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit))
+              of "string":
+                newCall(bindSym("getStr"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit))
+              of "bool":
+                newCall(bindSym("getBool"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit))
+              else:
+                newCall(bindSym("getStr"), newCall(bindSym("[]"), jsonArgsIdent, paramNameLit))
+            if defaultVal.kind != nnkEmpty:
+              # Optional param: honor the proc's default when the key is absent
+              # (matches the schema, which only lists default-less params as
+              # required).
+              extraction = nnkIfExpr.newTree(
+                nnkElifExpr.newTree(
+                  newCall(bindSym("hasKey"), jsonArgsIdent, paramNameLit),
+                  extraction),
+                nnkElseExpr.newTree(defaultVal.copyNimTree))
+            argExtractions.add(extraction)
 
     # Build the function call and wrapper body
     let functionCall = newCall(procName, argExtractions)
