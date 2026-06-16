@@ -39,40 +39,99 @@ proc nimTypeToJsonSchema(nimType: NimNode): JsonNode =
     result = newJObject()
     result["type"] = newJString("string")  # Default fallback
 
+proc isIdentifier(s: string): bool =
+  if s.len == 0 or not (s[0] in {'a'..'z', 'A'..'Z', '_'}):
+    return false
+  for c in s:
+    if c notin {'a'..'z', 'A'..'Z', '0'..'9', '_'}:
+      return false
+  return true
+
+proc paramLineNames(line: string): seq[string] =
+  ## If `line` is a parameter description line ("- name: ..." or
+  ## "- a, b, c: ..."), return the parameter names, else empty.
+  if not line.startsWith("-"):
+    return @[]
+  let parts = line[1..^1].split(":", 1)
+  if parts.len != 2:
+    return @[]
+  var names: seq[string] = @[]
+  for name in parts[0].split(","):
+    let clean = name.strip()
+    if not clean.isIdentifier():
+      return @[]
+    names.add(clean)
+  return names
+
 # Extract documentation and parameter descriptions from proc node
 proc extractDocComments(procNode: NimNode): (string, Table[string, string]) =
-  var description = ""
+  var descriptionLines: seq[string] = @[]
   var paramDescriptions = initTable[string, string]()
-  
+  # Names from the most recent "- name:" line; continuation lines (indented
+  # prose that follows) append to these params' descriptions.
+  var currentParams: seq[string] = @[]
+
   # Look for doc comments in the proc body (they appear as the first statements)
   let body = procNode[^1]  # Last element is the body
   if body.kind == nnkStmtList and body.len > 0:
     for stmt in body:
       if stmt.kind == nnkCommentStmt:
-        let docText = stmt.strVal.strip()
-        let lines = docText.splitLines()
-        for line in lines:
+        for line in stmt.strVal.strip().splitLines():
           let cleanLine = line.strip()
-          if cleanLine.startsWith("-"):
-            # Parameter description line
-            let parts = cleanLine[1..^1].split(":", 1)
-            if parts.len == 2:
-              let paramName = parts[0].strip()
-              paramDescriptions[paramName] = parts[1].strip()
-          elif cleanLine != "" and description == "":
-            # Main description line (first non-empty, non-parameter line)
-            description = cleanLine
+          let names = paramLineNames(cleanLine)
+          if names.len > 0:
+            currentParams = names
+            let desc = cleanLine[1..^1].split(":", 1)[1].strip()
+            for name in names:
+              paramDescriptions[name] = desc
+          elif cleanLine == "":
+            currentParams = @[]
+            if descriptionLines.len > 0:
+              descriptionLines.add("")
+          elif currentParams.len > 0:
+            for name in currentParams:
+              paramDescriptions[name] = paramDescriptions[name] & " " & cleanLine
+          else:
+            descriptionLines.add(cleanLine)
         break  # Only process the first comment block
-  
-  return (description, paramDescriptions)
 
-# Generate JSON schema from proc parameters with descriptions
-proc generateInputSchema(params: NimNode, paramDescs: Table[string, string]): JsonNode =
+  return (descriptionLines.join("\n").strip(), paramDescriptions)
+
+proc defaultValueToJson(node: NimNode): JsonNode =
+  ## Compile-time default value → JSON, for literal defaults only.
+  ## Returns nil for expressions that can't be represented.
+  case node.kind:
+  of nnkIntLit..nnkUInt64Lit:
+    newJInt(node.intVal.int)
+  of nnkFloatLit..nnkFloat64Lit:
+    newJFloat(node.floatVal)
+  of nnkStrLit..nnkTripleStrLit:
+    newJString(node.strVal)
+  of nnkIdent:
+    case $node:
+    of "true": newJBool(true)
+    of "false": newJBool(false)
+    else: nil
+  of nnkPrefix:
+    if node.len == 2 and $node[0] == "-":
+      let inner = defaultValueToJson(node[1])
+      if inner == nil: nil
+      elif inner.kind == JInt: newJInt(-inner.getInt)
+      elif inner.kind == JFloat: newJFloat(-inner.getFloat)
+      else: nil
+    else:
+      nil
+  else:
+    nil
+
+# Generate JSON schema from proc parameters with descriptions.
+# `firstParam` is 1 for regular tools (skip the implicit result) and 2 for
+# context-aware tools (also skip the McpRequestContext parameter).
+proc generateInputSchema(params: NimNode, paramDescs: Table[string, string], firstParam: int): JsonNode =
   var properties = newJObject()
   var required = newJArray()
-  
-  # Skip first param (implicit result) and start from index 1
-  for i in 1..<params.len:
+
+  for i in firstParam..<params.len:
     let param = params[i]
     if param.kind == nnkIdentDefs:
       let paramType = param[^2]  # Type is second to last
@@ -82,39 +141,16 @@ proc generateInputSchema(params: NimNode, paramDescs: Table[string, string]): Js
           var prop = nimTypeToJsonSchema(paramType)
           if paramName in paramDescs:
             prop["description"] = newJString(paramDescs[paramName])
-          properties[paramName] = prop
           # A param with a default value is optional — the dispatcher fills it in
           # when the caller omits it. Only default-less params are required.
           if param[^1].kind == nnkEmpty:
             required.add(newJString(paramName))
-
-  result = newJObject()
-  result["type"] = newJString("object")
-  result["properties"] = properties
-  result["required"] = required
-
-# Generate JSON schema from proc parameters with descriptions, skipping first parameter
-proc generateInputSchemaSkipFirst(params: NimNode, paramDescs: Table[string, string]): JsonNode =
-  var properties = newJObject()
-  var required = newJArray()
-
-  # Skip first param (implicit result) and second param (context), start from index 2
-  for i in 2..<params.len:
-    let param = params[i]
-    if param.kind == nnkIdentDefs:
-      let paramType = param[^2]  # Type is second to last
-      for j in 0..<param.len-2:  # All except type and default value
-        let paramName = $param[j]
-        if paramName != "":
-          var prop = nimTypeToJsonSchema(paramType)
-          if paramName in paramDescs:
-            prop["description"] = newJString(paramDescs[paramName])
+          else:
+            let defaultJson = defaultValueToJson(param[^1])
+            if defaultJson != nil:
+              prop["default"] = defaultJson
           properties[paramName] = prop
-          # A param with a default value is optional — the dispatcher fills it in
-          # when the caller omits it. Only default-less params are required.
-          if param[^1].kind == nnkEmpty:
-            required.add(newJString(paramName))
-  
+
   result = newJObject()
   result["type"] = newJString("object")
   result["properties"] = properties
@@ -155,10 +191,7 @@ macro mcpTool*(procDef: untyped): untyped =
         contextParamName = $firstParam[0]
   
   # Generate input schema from parameters (skip context parameter for schema)
-  let inputSchema = if isContextAware:
-                      generateInputSchemaSkipFirst(params, paramDescs)
-                    else:
-                      generateInputSchema(params, paramDescs)
+  let inputSchema = generateInputSchema(params, paramDescs, firstParam = if isContextAware: 2 else: 1)
   
   # Generate the wrapper proc name to avoid conflicts
   let wrapperName = ident("tool_" & toolName & "_wrapper")
