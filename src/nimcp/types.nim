@@ -76,6 +76,7 @@ type
 
   McpToolResult* = object
     content*: seq[McpContent]
+    isError*: bool  ## true marks a tool-execution failure (per MCP spec)
 
   # Resource types
   McpResource* = object
@@ -491,9 +492,11 @@ proc requireStringField*(node: JsonNode, field: string): string {.gcsafe.} =
 
 # Custom JSON serialization for McpToolResult
 proc `%`*(toolResult: McpToolResult): JsonNode {.gcsafe.} =
-  %*{
+  result = %*{
     "content": contentsToJsonArray(toolResult.content)
   }
+  if toolResult.isError:
+    result["isError"] = %true
 
 # Custom JSON serialization for McpResourceContents
 proc `%`*(resource: McpResourceContents): JsonNode {.gcsafe.} =

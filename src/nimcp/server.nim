@@ -64,7 +64,7 @@ proc newMcpServer*(name: string, version: string): McpServer =
   result.logger.setupChroniclesLogging()
   
   # Log server initialization
-  result.logger.info("MCP server initialized", 
+  result.logger.debug("MCP server initialized",
     context = {"name": %name, "version": %version}.toTable)
 
 
@@ -425,6 +425,16 @@ template dispatch*[T, U, V, W](server: McpServer, lock: Lock, contextAwareHandle
   else:
     regularHandler(extraArgs, args)
 
+var currentToolErrored {.threadvar.}: bool
+
+proc markToolError*() {.gcsafe.} =
+  ## Flag the in-progress tool call's result as an error (sets isError on the
+  ## returned McpToolResult) without raising. For tools that already handle a
+  ## failure and return its message as their value — call this, then return the
+  ## message as usual. Reset before each tool call, so it only affects the
+  ## current one.
+  currentToolErrored = true
+
 proc handleToolsCall*(server: McpServer, params: JsonNode, ctx: McpRequestContext = nil): JsonNode {.gcsafe.} =
   let toolName = requireStringField(params, "name")
   if toolName.len == 0:
@@ -436,6 +446,7 @@ proc handleToolsCall*(server: McpServer, params: JsonNode, ctx: McpRequestContex
   var regularHandler: McpToolHandler
   var hasContextHandler = false
   var hasRegularHandler = false
+  var requiredParams: seq[string]
 
   withLock toolsLock:
     if toolName in server.contextAwareToolHandlers:
@@ -446,16 +457,40 @@ proc handleToolsCall*(server: McpServer, params: JsonNode, ctx: McpRequestContex
       hasRegularHandler = true
     else:
       raise newException(ValueError, "Tool not found: " & toolName)
+    if toolName in server.tools:
+      let schema = server.tools[toolName].inputSchema
+      if not schema.isNil and schema.kind == JObject and schema.hasKey("required"):
+        for name in schema["required"]:
+          requiredParams.add(name.getStr)
+
+  # Missing required arguments are an InvalidParams protocol error, not a tool
+  # failure — raise before invoking so they don't reach the handler as a KeyError.
+  for name in requiredParams:
+    if not args.hasKey(name):
+      raise newException(ValueError,
+        "Missing required argument '" & name & "' for tool '" & toolName & "'")
 
   let requestCtx = if ctx != nil: ctx else: newMcpRequestContextWithServer(server, McpTransport())
   if server.enableContextLogging:
     requestCtx.info("Executing Tool: " & toolName)
 
-  let res = if hasContextHandler:
-    contextHandler(requestCtx, args)
-  else:
-    regularHandler(args)
-  
+  # A raised CatchableError is the tool reporting failure: return it as a tool
+  # result with isError set (visible to the model) rather than a JSON-RPC
+  # protocol error. Defects still propagate to the request handler. A tool that
+  # handles its own failure can instead call markToolError() and return the
+  # message normally — picked up below.
+  currentToolErrored = false
+  var res =
+    try:
+      if hasContextHandler:
+        contextHandler(requestCtx, args)
+      else:
+        regularHandler(args)
+    except CatchableError as e:
+      McpToolResult(content: @[createTextContent(e.msg)], isError: true)
+  if currentToolErrored:
+    res.isError = true
+
   # Create response manually to avoid GC safety issues
   var responseJson = newJObject()
   responseJson["content"] = newJArray()
@@ -476,6 +511,8 @@ proc handleToolsCall*(server: McpServer, params: JsonNode, ctx: McpRequestContex
         resourceJson["mimeType"] = newJString(content.resource.mimeType.get)
       contentJson["resource"] = resourceJson
     responseJson["content"].add(contentJson)
+  if res.isError:
+    responseJson["isError"] = newJBool(true)
   return responseJson
 
 proc handleResourcesList*(server: McpServer): JsonNode {.gcsafe.} =
